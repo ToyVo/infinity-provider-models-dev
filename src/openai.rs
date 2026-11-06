@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_shapes() {
-        assert!(discovered_ids(&json!({"models": []})).is_empty());
-        assert!(discovered_ids(&Value::Null).is_empty());
+        assert_eq!(discovered_ids(&json!({"models": []})), Vec::<String>::new());
+        assert_eq!(discovered_ids(&Value::Null), Vec::<String>::new());
     }
 }

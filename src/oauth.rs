@@ -725,7 +725,7 @@ mod tests {
         assert!(auth.url.contains(CLIENT_ID));
         assert!(auth.url.contains("code_challenge_method=S256"));
         assert!(auth.url.contains("code_challenge="));
-        assert!(!auth.verifier.is_empty());
-        assert!(!auth.state.is_empty());
+        assert_ne!(auth.verifier, String::new());
+        assert_ne!(auth.state, String::new());
     }
 }

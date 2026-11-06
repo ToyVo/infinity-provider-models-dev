@@ -1,13 +1,17 @@
 # infinity-provider-models-dev
 
+[![crates.io](https://img.shields.io/crates/v/infinity-provider-models-dev.svg)](https://crates.io/crates/infinity-provider-models-dev)
+[![docs.rs](https://img.shields.io/docsrs/infinity-provider-models-dev)](https://docs.rs/infinity-provider-models-dev)
+[![license](https://img.shields.io/crates/l/infinity-provider-models-dev)](https://github.com/ToyVo/infinity-provider-models-dev#license)
+
 Multi-backend model provider for [Infinity](https://github.com/hydro-project/infinity) coding agents, configured through the same API-key env vars that [pi](https://pi.dev/docs/latest/providers) and [opencode](https://opencode.ai/v2/docs/providers/) understand — the non-Amazon counterpart to `infinity-provider-bedrock`.
 
-Each configured upstream backend contributes its models under `<backend>/<model>` ids (e.g. `groq/llama-3.3-70b-versatile`, `anthropic/claude-sonnet-4-6`). OpenAI-compatible backends speak Chat Completions streaming; Anthropic speaks Messages streaming. Both are translated into the `infinity-provider-protocol` types, with Bedrock-style error classification (`Throttled` / `ContextOverflow` / `Transient` / `Fatal`) so the runtime can retry intelligently.
+Each configured upstream backend contributes its models under `<backend>/<model>` ids (e.g. `groq/openai/gpt-oss-120b`, `anthropic/claude-sonnet-4-6`). OpenAI-compatible backends speak Chat Completions streaming; Anthropic speaks Messages streaming. Both are translated into the `infinity-provider-protocol` types, with Bedrock-style error classification (`Throttled` / `ContextOverflow` / `Transient` / `Fatal`) so the runtime can retry intelligently. Requires Rust 1.85+.
 
 ## Install
 
 ```bash
-cargo install --path .
+cargo install --locked infinity-provider-models-dev
 ```
 
 Register with the daemon (`~/.infinity/providers.json` — first provider's first model is the global default, order matters):
@@ -19,6 +23,20 @@ Register with the daemon (`~/.infinity/providers.json` — first provider's firs
 ```
 
 The binary prints its Unix socket path on stdout and serves the provider over it, same as `infinity-provider-bedrock`.
+
+Set at least one API key (see [Configure](#configure)), e.g. `export GROQ_API_KEY=...`, then start the daemon.
+
+## Library usage
+
+```rust
+use infinity_provider_models_dev::MultiProvider;
+use infinity_provider_protocol::ModelProvider;
+
+let provider = MultiProvider::from_env(); // reads process env, see below
+let models = provider.list_models().await?;
+```
+
+See [docs.rs](https://docs.rs/infinity-provider-models-dev) for the full API.
 
 ## Configure
 
@@ -119,3 +137,15 @@ Advertised models (`Opus`/`Sonnet 4.6`, `Haiku 4.5` at 200K context) are a conse
 ### Caller overrides
 
 Like Bedrock's `additional_model_request_fields`, `additional_params` in the completion request is deep-merged into the outgoing JSON body, and `max_tokens` overrides the per-model default.
+
+## Development
+
+```bash
+cargo script run ci   # fmt-check + clippy (deny-by-default pedantic/nursery) + tests
+```
+
+`cargo install cargo-run` provides the `cargo script` subcommand; tasks are defined in `Scripts.toml` (`cargo script show` to list). The model catalog regenerates from [anomalyco/models.dev](https://github.com/anomalyco/models.dev) — see [Where the model list comes from](#where-the-model-list-comes-from).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](https://github.com/ToyVo/infinity-provider-models-dev/blob/main/LICENSE) for the full text.

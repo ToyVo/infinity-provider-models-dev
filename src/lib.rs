@@ -76,16 +76,17 @@ impl MultiProvider {
                     tracing::warn!("duplicate model id {model_id}, keeping first");
                     continue;
                 }
+                let entry = ModelEntry {
+                    model_id: model_id.clone(),
+                    display_name: format!("{} ({})", m.display, backend.preset_id),
+                    context_window: m.context_window,
+                    max_output_tokens: m.max_output_tokens,
+                    supports_image_input: m.supports_images,
+                };
                 routes.insert(
-                    model_id.clone(),
+                    model_id,
                     Route {
-                        entry: ModelEntry {
-                            model_id: model_id.clone(),
-                            display_name: format!("{} ({})", m.display, backend.preset_id),
-                            context_window: m.context_window,
-                            max_output_tokens: m.max_output_tokens,
-                            supports_image_input: m.supports_images,
-                        },
+                        entry,
                         backend_idx: idx,
                         upstream_model: m.upstream.clone(),
                         default_max_tokens: m.max_output_tokens,
