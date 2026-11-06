@@ -1,6 +1,6 @@
 //! Model catalog generated from anomalyco/models.dev.
 //! DO NOT EDIT — regenerate with `rust-script scripts/sync-models-dev.rs`.
-//! Source revision: anomalyco/models.dev@a276c37.
+//! Source revision: anomalyco/models.dev@6d51383f3.
 
 use crate::preset::PresetModel;
 pub const OPENAI: &[PresetModel] = &[
@@ -241,18 +241,18 @@ pub const MOONSHOT: &[PresetModel] = &[
 ];
 pub const ZAI: &[PresetModel] = &[
     PresetModel {
-        id: "glm-4.6",
-        display_name: "GLM-4.6",
-        context_window: 204_800,
+        id: "glm-5.3",
+        display_name: "GLM-5.3",
+        context_window: 1_000_000,
         max_output_tokens: Some(131_072),
         supports_images: false,
     },
     PresetModel {
-        id: "glm-5",
-        display_name: "GLM-5",
-        context_window: 204_800,
+        id: "glm-5.3-flash",
+        display_name: "GLM-5.3-Flash",
+        context_window: 1_000_000,
         max_output_tokens: Some(131_072),
-        supports_images: false,
+        supports_images: true,
     },
 ];
 pub const MINIMAX: &[PresetModel] = &[

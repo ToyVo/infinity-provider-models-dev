@@ -164,7 +164,7 @@ const CATALOG: &[Preset] = &[
     Preset {
         id: "zai",
         provider: "zai",
-        models: &["glm-4.6", "glm-5"],
+        models: &["glm-5.3", "glm-5.3-flash"],
         suffix: "",
         key_envs: &["ZAI_API_KEY"],
     },
