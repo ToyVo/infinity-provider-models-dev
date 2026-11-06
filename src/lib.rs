@@ -139,6 +139,58 @@ impl MultiProvider {
     pub fn into_arc(self) -> Arc<Self> {
         Arc::new(self)
     }
+
+    /// Reorder `entries` so the `INFINITY_DEFAULT_MODEL` id (if set) comes
+    /// first. Existing ids move; unlisted ids on a known backend are
+    /// synthesized as passthrough entries; unknown prefixes warn and keep
+    /// the order.
+    fn apply_default_override(&self, entries: &mut Vec<ModelEntry>, wanted: Option<String>) {
+        let Some(wanted) = wanted else {
+            return;
+        };
+        if let Some(pos) = entries.iter().position(|e| e.model_id == wanted) {
+            if pos != 0 {
+                let entry = entries.remove(pos);
+                entries.insert(0, entry);
+            }
+            tracing::info!("default model pinned by {DEFAULT_MODEL_ENV}: {wanted}");
+            return;
+        }
+        let Some((prefix, rest)) = wanted.split_once('/') else {
+            tracing::warn!("{DEFAULT_MODEL_ENV}={wanted} is not a <backend>/<model> id; ignoring");
+            return;
+        };
+        if rest.is_empty() || !self.backends.iter().any(|b| b.preset_id == prefix) {
+            tracing::warn!("{DEFAULT_MODEL_ENV}={wanted} matches no known backend; ignoring");
+            return;
+        }
+        tracing::warn!(
+            "{DEFAULT_MODEL_ENV}={wanted} is not in the advertised list; \
+             advertising it first as a passthrough (invoke may fail if the id is wrong)"
+        );
+        entries.insert(
+            0,
+            ModelEntry {
+                model_id: wanted.clone(),
+                display_name: format!("{rest} ({prefix})"),
+                context_window: 200_000,
+                max_output_tokens: Some(32_000),
+                supports_image_input: false,
+            },
+        );
+    }
+}
+
+/// Env var pinning the global default: when set to a full `model_id`
+/// (`<backend>/<upstream-id>`), that model is advertised first from
+/// `list_models` so infinity picks it as the default.
+pub const DEFAULT_MODEL_ENV: &str = "INFINITY_DEFAULT_MODEL";
+
+fn default_model_override() -> Option<String> {
+    std::env::var(DEFAULT_MODEL_ENV)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
 }
 
 #[async_trait]
@@ -182,6 +234,10 @@ impl ModelProvider for MultiProvider {
                 known.insert(model_id);
             }
         }
+        // Env override runs after discovery so a discovered id can also be
+        // pinned to the top.
+        let wanted = default_model_override();
+        self.apply_default_override(&mut entries, wanted);
         Ok(entries)
     }
 
@@ -294,17 +350,147 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn lists_namespaced_models_in_registration_order() {
-        // Registration order (not alphabetical) decides the listing: the
-        // daemon treats the first model as the global default.
-        let p = MultiProvider::from_backends(vec![
+    fn two_backend_provider() -> MultiProvider {
+        MultiProvider::from_backends(vec![
             backend("openai", vec![("gpt-5.4", "GPT")]),
             backend("groq", vec![("llama-3.3-70b-versatile", "Llama")]),
-        ]);
+        ])
+    }
+
+    fn baseline_entries(p: &MultiProvider) -> Vec<ModelEntry> {
+        let mut routes: Vec<&Route> = p.routes.values().collect();
+        routes.sort_by_key(|r| r.order);
+        routes.into_iter().map(|r| r.entry.clone()).collect()
+    }
+
+    fn ids(entries: &[ModelEntry]) -> Vec<&str> {
+        entries.iter().map(|m| m.model_id.as_str()).collect()
+    }
+
+    #[test]
+    fn default_override_moves_existing_model_first() {
+        let p = two_backend_provider();
+        let mut entries = baseline_entries(&p);
+        p.apply_default_override(
+            &mut entries,
+            Some("groq/llama-3.3-70b-versatile".to_owned()),
+        );
+        assert_eq!(
+            ids(&entries),
+            vec!["groq/llama-3.3-70b-versatile", "openai/gpt-5.4"]
+        );
+    }
+
+    #[test]
+    fn default_override_synthesizes_passthrough_for_known_backend() {
+        let p = two_backend_provider();
+        let mut entries = baseline_entries(&p);
+        p.apply_default_override(&mut entries, Some("groq/some-future-model".to_owned()));
+        assert_eq!(
+            ids(&entries),
+            vec![
+                "groq/some-future-model",
+                "openai/gpt-5.4",
+                "groq/llama-3.3-70b-versatile"
+            ]
+        );
+    }
+
+    #[test]
+    fn default_override_unknown_prefix_leaves_order() {
+        let p = two_backend_provider();
+        let mut entries = baseline_entries(&p);
+        p.apply_default_override(&mut entries, Some("nope/nothing".to_owned()));
+        assert_eq!(
+            ids(&entries),
+            vec!["openai/gpt-5.4", "groq/llama-3.3-70b-versatile"]
+        );
+    }
+
+    #[test]
+    fn default_override_none_is_noop() {
+        let p = two_backend_provider();
+        let mut entries = baseline_entries(&p);
+        p.apply_default_override(&mut entries, None);
+        assert_eq!(
+            ids(&entries),
+            vec!["openai/gpt-5.4", "groq/llama-3.3-70b-versatile"]
+        );
+    }
+
+    #[test]
+    fn default_model_env_parsing_trims_and_rejects_empty() {
+        let _guard = default_env_lock();
+        let saved = std::env::var(DEFAULT_MODEL_ENV).ok();
+        unsafe {
+            std::env::set_var(DEFAULT_MODEL_ENV, "  groq/m  ");
+        }
+        assert_eq!(default_model_override(), Some("groq/m".to_owned()));
+        unsafe {
+            std::env::set_var(DEFAULT_MODEL_ENV, "   ");
+        }
+        assert_eq!(default_model_override(), None);
+        restore_default_env(saved);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn lists_namespaced_models_in_registration_order() {
+        // Registration order (not alphabetical) decides the listing: the
+        // daemon treats the first model as the global default. Isolated
+        // from INFINITY_DEFAULT_MODEL which other tests mutate.
+        let _guard = default_env_lock();
+        let saved = std::env::var(DEFAULT_MODEL_ENV).ok();
+        unsafe {
+            std::env::remove_var(DEFAULT_MODEL_ENV);
+        }
+        let p = two_backend_provider();
         let models = p.list_models().await.unwrap();
-        let ids: Vec<_> = models.iter().map(|m| m.model_id.as_str()).collect();
-        assert_eq!(ids, vec!["openai/gpt-5.4", "groq/llama-3.3-70b-versatile"]);
+        // `list_models` reads the env after an await point, so restore only
+        // after it returns while still holding the lock.
+        let list_ids: Vec<String> = models.iter().map(|m| m.model_id.clone()).collect();
+        restore_default_env(saved);
+        assert_eq!(
+            list_ids,
+            vec!["openai/gpt-5.4", "groq/llama-3.3-70b-versatile"]
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn list_models_pins_default_from_env_end_to_end() {
+        let _guard = default_env_lock();
+        let saved = std::env::var(DEFAULT_MODEL_ENV).ok();
+        unsafe {
+            std::env::set_var(DEFAULT_MODEL_ENV, "groq/llama-3.3-70b-versatile");
+        }
+        let p = two_backend_provider();
+        let models = p.list_models().await.unwrap();
+        let list_ids: Vec<String> = models.iter().map(|m| m.model_id.clone()).collect();
+        restore_default_env(saved);
+        assert_eq!(
+            list_ids,
+            vec!["groq/llama-3.3-70b-versatile", "openai/gpt-5.4"]
+        );
+    }
+
+    fn default_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn restore_default_env(saved: Option<String>) {
+        if let Some(v) = saved {
+            unsafe {
+                std::env::set_var(DEFAULT_MODEL_ENV, v);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(DEFAULT_MODEL_ENV);
+            }
+        }
     }
 
     #[tokio::test]

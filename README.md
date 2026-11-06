@@ -77,6 +77,13 @@ OpenCode Go sends a stable per-process `x-opencode-session` id for routing and p
 ### Per-backend overrides
 
 ```bash
+# Pin the global default (infinity uses the first advertised model):
+export INFINITY_DEFAULT_MODEL=groq/openai/gpt-oss-120b
+# Exact <backend>/<model> id; a known-but-unlisted id is advertised first as
+# passthrough, an unknown backend prefix warns and keeps the normal order.
+```
+
+```bash
 # Point any backend at a proxy, and/or advertise different models:
 export GROQ_BASE_URL=https://proxy.internal/groq
 export GROQ_MODELS=llama-3.3-70b-versatile,openai/gpt-oss-120b
