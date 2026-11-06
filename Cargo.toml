@@ -1,0 +1,57 @@
+[package]
+name = "infinity-provider-models-dev"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Multi-backend model provider for Infinity coding agents, using the model catalog from models.dev"
+license = "Apache-2.0"
+repository = "https://github.com/ToyVo/infinity-provider-models-dev"
+documentation = "https://docs.rs/infinity-provider-models-dev"
+
+[[bin]]
+name = "infinity-provider-models-dev"
+path = "src/main.rs"
+
+[lib]
+name = "infinity_provider_models_dev"
+path = "src/lib.rs"
+
+[dependencies]
+infinity-provider-protocol = { version = "0.2.0", features = ["remote"] }
+async-trait = "0.1"
+async-stream = "0.3"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+base64 = "0.22"
+dirs = "6"
+getrandom = "0.3"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_attr_outside_unsafe = "deny"
+missing_unsafe_on_extern = "deny"
+
+[features]
+default = []
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"

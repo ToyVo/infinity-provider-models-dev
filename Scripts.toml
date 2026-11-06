@@ -1,0 +1,36 @@
+# Project automation, run with `cargo-run` (`cargo install cargo-run`):
+#   cargo script <name> [-- <script args>]
+#   cargo script show            # list all scripts
+#   cargo script validate        # validate this file
+
+[scripts.sync]
+script_file = "./scripts/sync-models-dev.rs"
+info        = "Regenerate src/catalog_generated.rs from anomalyco/models.dev"
+
+[scripts.check]
+command = "cargo check --all-targets"
+info    = "Type-check all targets"
+
+[scripts.lint]
+command = "cargo clippy --all-targets"
+info    = "Lint with the workspace deny-by-default lints"
+
+[scripts.fmt]
+command = "cargo fmt"
+info    = "Format all targets"
+
+[scripts.fmt-check]
+command = "cargo fmt --check"
+info    = "Fail when formatting drifts"
+
+[scripts.test]
+command = "cargo test"
+info    = "Run the test suite"
+
+[scripts.build]
+command = "cargo build"
+info    = "Build the provider binary"
+
+[scripts.ci]
+include = ["fmt-check", "lint", "test"]
+info    = "Full CI: format check, lints, tests"
