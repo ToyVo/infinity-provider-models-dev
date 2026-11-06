@@ -39,6 +39,12 @@ use preset::{Flavor, ResolvedBackend};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Crate user agent sent on every upstream request.
+///
+/// Providers (notably `OpenCode Go`) ask clients to identify with their own
+/// agent string rather than a generic HTTP-library default.
+pub const USER_AGENT: &str = concat!("infinity-provider-models-dev/", env!("CARGO_PKG_VERSION"));
+
 /// One advertised model: its infinity-facing id plus where to route it.
 #[derive(Clone, Debug)]
 struct Route {

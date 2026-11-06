@@ -56,7 +56,8 @@ pub async fn invoke(
         .post(&url)
         .timeout(REQUEST_TIMEOUT)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream");
+        .header("Accept", "text/event-stream")
+        .header("User-Agent", crate::USER_AGENT);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }
@@ -410,7 +411,8 @@ pub async fn discover_models(client: &Client, base_url: &str, api_key: &str) -> 
     let mut req = client
         .get(&url)
         .timeout(DISCOVERY_TIMEOUT)
-        .header("Accept", "application/json");
+        .header("Accept", "application/json")
+        .header("User-Agent", crate::USER_AGENT);
     if !api_key.is_empty() {
         req = req.bearer_auth(api_key);
     }

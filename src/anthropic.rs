@@ -389,7 +389,9 @@ async fn post_messages(
             .bearer_auth(api_key)
             .header("anthropic-beta", oauth::OAUTH_BETA);
     } else {
-        req = req.header("x-api-key", api_key);
+        req = req
+            .header("x-api-key", api_key)
+            .header("User-Agent", crate::USER_AGENT);
     }
     for (k, v) in extra_headers {
         req = req.header(k.as_str(), v.as_str());
