@@ -3,6 +3,8 @@
 //! Used for `ANTHROPIC_API_KEY` (and compatible env aliases). The rest of
 //! the presets go through the OpenAI-compatible backend in `openai.rs`.
 
+use std::future::Future;
+
 use async_stream::stream;
 use futures_util::StreamExt;
 use infinity_provider_protocol::{
@@ -15,7 +17,13 @@ use serde_json::{Value, json};
 use crate::convert::{classify_http_status, error_message_from_body};
 use crate::oauth::{self, OAuthSessionHandle};
 
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long to wait for the endpoint to accept a request (connect, send,
+/// response headers). This deliberately covers only initiation: once a
+/// stream is live it must never be cut off by a total deadline.
+const REQUEST_INITIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a live stream may go without yielding a chunk before it is
+/// treated as stalled.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// How to reach and authenticate one `Anthropic` backend.
@@ -45,8 +53,14 @@ pub async fn invoke(
     upstream_model: &str,
     default_max_tokens: Option<u64>,
     request: CompletionRequest,
+    supports_images: bool,
 ) -> Result<ModelStream, CompletionError> {
-    let body = request_body(upstream_model, default_max_tokens, &request);
+    let body = request_body(
+        upstream_model,
+        default_max_tokens,
+        &request,
+        supports_images,
+    );
 
     // Subscription sessions mint a bearer token (refreshing when needed);
     // plain API keys pass through untouched.
@@ -54,27 +68,36 @@ pub async fn invoke(
         Some(handle) => Some(ensure_bearer(backend.client, handle, false).await?),
         None => None,
     };
-    let mut resp = post_messages(
-        backend.client,
-        backend.base_url,
-        backend.api_key,
-        oauth_token.as_deref(),
-        backend.extra_headers,
-        &body,
-    )
-    .await?;
+    // Bound only initiation (connect, send, response headers). The body
+    // stream below has no total deadline; stalled streams trip the idle
+    // watchdog instead.
     // A `401` means the bearer died between the freshness check and the
     // request: refresh once and retry before surfacing the failure.
+    let mut resp = with_initiation_timeout(
+        post_messages(
+            backend.client,
+            backend.base_url,
+            backend.api_key,
+            oauth_token.as_deref(),
+            backend.extra_headers,
+            &body,
+        ),
+        backend.base_url,
+    )
+    .await?;
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         if let Some(handle) = backend.oauth {
             let token = ensure_bearer(backend.client, handle, true).await?;
-            resp = post_messages(
-                backend.client,
+            resp = with_initiation_timeout(
+                post_messages(
+                    backend.client,
+                    backend.base_url,
+                    backend.api_key,
+                    Some(token.as_str()),
+                    backend.extra_headers,
+                    &body,
+                ),
                 backend.base_url,
-                backend.api_key,
-                Some(&token),
-                backend.extra_headers,
-                &body,
             )
             .await?;
         }
@@ -94,25 +117,50 @@ pub async fn invoke(
         ));
     }
 
-    let mut byte_stream = resp.bytes_stream();
+    Ok(adapt_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT))
+}
 
-    let s = stream! {
+/// Adapt a raw SSE byte stream into protocol chunks.
+///
+/// `idle_timeout` bounds silence between chunks, not the whole stream.
+/// Transport failures, stalls, and terminal error frames close the stream
+/// without emitting tool calls, reasoning, or a `Final` that would read
+/// as a successful completion.
+fn adapt_stream<S, B, E>(mut byte_stream: S, idle_timeout: std::time::Duration) -> ModelStream
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Box::pin(stream! {
         let mut buf = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut state = StreamState::new();
+        let mut failed = false;
 
-        while let Some(chunk) = byte_stream.next().await {
+        'chunks: loop {
+            let chunk = tokio::time::timeout(idle_timeout, byte_stream.next()).await;
+            let chunk = match chunk {
+                Err(_) => {
+                    yield Err(CompletionError::ResponseError(
+                        "stream stalled: no chunks received".to_owned(),
+                    ));
+                    failed = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk,
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
                     yield Err(CompletionError::ResponseError(format!("stream read failed: {e}")));
+                    failed = true;
                     break;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(end) = buf.find("\n\n") {
-                let frame_end = end.saturating_add(2);
-                let frame: String = buf.drain(..frame_end).collect();
-                buf = buf.trim_start_matches(['\n', '\r']).to_owned();
+            crate::convert::push_bytes(&mut buf, &mut pending, bytes.as_ref());
+            for frame in crate::convert::take_frames(&mut buf) {
                 let Some((event, data)) = split_event(&frame) else {
                     continue;
                 };
@@ -120,18 +168,30 @@ pub async fn invoke(
                     continue;
                 }
                 let Ok(v) = serde_json::from_str::<Value>(&data) else {
+                    tracing::debug!(
+                        "anthropic: skipping malformed frame: {}",
+                        data.chars().take(200).collect::<String>()
+                    );
                     continue;
                 };
+                let is_terminal_error = event == "error";
                 for item in state.handle_event(&event, &v) {
                     yield item;
                 }
+                if is_terminal_error {
+                    failed = true;
+                    break 'chunks;
+                }
             }
         }
-        yield Ok(StreamChunk::Final(FinalResponse {
-            usage: Some(state.usage),
-        }));
-    };
-    Ok(Box::pin(s))
+        if !failed {
+            for item in state.finish() {
+                yield item;
+            }
+            let usage = (state.usage != Usage::default()).then_some(state.usage);
+            yield Ok(StreamChunk::Final(FinalResponse { usage }));
+        }
+    })
 }
 
 /// Split one SSE frame into its `event:` name and `data:` payload.
@@ -155,6 +215,14 @@ fn split_event(frame: &str) -> Option<(String, String)> {
     Some((event, data))
 }
 
+/// Which kind of content block is currently open, if tracked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    Tool,
+    Thinking,
+    Other,
+}
+
 /// Mutable state for one `Anthropic` streaming response.
 struct StreamState {
     usage: Usage,
@@ -163,6 +231,9 @@ struct StreamState {
     tool_name: String,
     tool_args: String,
     tool_name_sent: bool,
+    open_block: Option<BlockKind>,
+    thinking: String,
+    thinking_signature: Option<String>,
 }
 
 impl StreamState {
@@ -174,7 +245,63 @@ impl StreamState {
             tool_name: String::new(),
             tool_args: String::new(),
             tool_name_sent: false,
+            open_block: None,
+            thinking: String::new(),
+            thinking_signature: None,
         }
+    }
+
+    /// Flush anything still open at a clean end of stream (mirrors the
+    /// per-block flushes below for streams that end without them).
+    fn finish(&mut self) -> Vec<Result<StreamChunk, CompletionError>> {
+        let mut out = self.flush_tool();
+        out.extend(self.flush_reasoning());
+        out
+    }
+
+    /// Complete the accumulated thinking block, if it has text.
+    ///
+    /// Mirrors the reference Bedrock provider: deltas stream the text live
+    /// and the complete block (text plus provider signature, when the
+    /// backend supplied one) is what gets recorded in history. Without the
+    /// signature, the next turn cannot resume extended thinking.
+    fn flush_reasoning(&mut self) -> Vec<Result<StreamChunk, CompletionError>> {
+        if self.thinking.is_empty() {
+            self.thinking_signature = None;
+            return Vec::new();
+        }
+        let reasoning = Reasoning::new_with_signature(
+            std::mem::take(&mut self.thinking),
+            self.thinking_signature.take(),
+        );
+        vec![Ok(StreamChunk::Reasoning(reasoning))]
+    }
+
+    /// Complete the accumulated tool call, if it has a name or arguments.
+    fn flush_tool(&mut self) -> Vec<Result<StreamChunk, CompletionError>> {
+        if self.tool_name.is_empty() && self.tool_args.is_empty() {
+            self.tool_id.clear();
+            self.tool_name_sent = false;
+            return Vec::new();
+        }
+        let args: Value = if self.tool_args.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&self.tool_args)
+                .unwrap_or_else(|_| json!({"_raw": self.tool_args}))
+        };
+        let id = if self.tool_id.is_empty() {
+            format!("tool-{}", self.tool_index)
+        } else {
+            self.tool_id.clone()
+        };
+        self.tool_index = self.tool_index.saturating_add(1);
+        let call = StreamChunk::ToolCall(ToolCall::new(id, self.tool_name.clone(), args));
+        self.tool_id.clear();
+        self.tool_name.clear();
+        self.tool_args.clear();
+        self.tool_name_sent = false;
+        vec![Ok(call)]
     }
 
     fn handle_event(
@@ -228,8 +355,20 @@ impl StreamState {
 
     fn on_block_start(&mut self, v: &Value) -> Vec<Result<StreamChunk, CompletionError>> {
         let block = v.get("content_block").unwrap_or(&Value::Null);
-        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-            return Vec::new();
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                self.open_block = Some(BlockKind::Tool);
+            }
+            // Thinking blocks (plain or redacted) accumulate server-side;
+            // only blocks with streamed text produce a Reasoning chunk.
+            Some("thinking" | "redacted_thinking") => {
+                self.open_block = Some(BlockKind::Thinking);
+                return Vec::new();
+            }
+            _ => {
+                self.open_block = Some(BlockKind::Other);
+                return Vec::new();
+            }
         }
         block
             .get("id")
@@ -267,13 +406,22 @@ impl StreamState {
                 }
                 Vec::new()
             }
-            Some("thinking_delta" | "signature_delta") => {
+            Some("thinking_delta") => {
                 if let Some(t) = delta.get("thinking").and_then(Value::as_str) {
                     if !t.is_empty() {
+                        self.thinking.push_str(t);
                         return vec![Ok(StreamChunk::ReasoningDelta {
                             id: None,
                             text: t.to_owned(),
                         })];
+                    }
+                }
+                Vec::new()
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                    if !signature.is_empty() {
+                        self.thinking_signature = Some(signature.to_owned());
                     }
                 }
                 Vec::new()
@@ -306,28 +454,36 @@ impl StreamState {
     }
 
     fn on_block_stop(&mut self) -> Vec<Result<StreamChunk, CompletionError>> {
-        if self.tool_name.is_empty() && self.tool_args.is_empty() {
-            return Vec::new();
+        let kind = self.open_block.take();
+        match kind {
+            Some(BlockKind::Thinking) => self.flush_reasoning(),
+            // Tool blocks flush here; text blocks never accumulate tool
+            // state, and an unknown block kind still flushes a tool call in
+            // case its start event was missed. `flush_tool` is a no-op
+            // without a name or arguments.
+            _ => self.flush_tool(),
         }
-        let args: Value = if self.tool_args.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&self.tool_args)
-                .unwrap_or_else(|_| json!({"_raw": self.tool_args}))
-        };
-        let id = if self.tool_id.is_empty() {
-            format!("tool-{}", self.tool_index)
-        } else {
-            self.tool_id.clone()
-        };
-        self.tool_index = self.tool_index.saturating_add(1);
-        let call = StreamChunk::ToolCall(ToolCall::new(id, self.tool_name.clone(), args));
-        self.tool_id.clear();
-        self.tool_name.clear();
-        self.tool_args.clear();
-        self.tool_name_sent = false;
-        vec![Ok(call)]
     }
+}
+
+/// Bound a send to initiation (connect, send, response headers).
+///
+/// A timeout here means the endpoint never started responding; the same
+/// request may succeed on retry.
+async fn with_initiation_timeout(
+    send: impl Future<Output = Result<reqwest::Response, CompletionError>> + Send,
+    base_url: &str,
+) -> Result<reqwest::Response, CompletionError> {
+    // `post_messages` already maps transport failures; this only adds the
+    // initiation deadline.
+    tokio::time::timeout(REQUEST_INITIATION_TIMEOUT, send)
+        .await
+        .map_err(|_| {
+            CompletionError::provider(
+                ErrorClass::Transient,
+                format!("{base_url}: request initiation timed out"),
+            )
+        })?
 }
 
 /// Resolve the subscription bearer token, refreshing when stale (`force`
@@ -357,10 +513,18 @@ fn is_oauth_token(api_key: &str) -> bool {
     api_key.starts_with("sk-ant-oauth")
 }
 
+/// Subscription auth headers: `Bearer` (no `x-api-key`) plus the `OAuth`
+/// beta and `Claude Code` identity headers, mirroring the community
+/// bridges. Shared by live sessions and pasted static bearer tokens.
+fn with_oauth_headers(req: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    req.bearer_auth(token)
+        .header("anthropic-beta", oauth::OAUTH_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("User-Agent", oauth::CLAUDE_CODE_USER_AGENT)
+        .header("x-app", "cli")
+}
+
 /// Send one `Messages` request with API-key or subscription auth.
-///
-/// Subscription (`Bearer`) requests omit `x-api-key` and carry the `OAuth`
-/// beta plus `Claude Code` identity headers, mirroring the community bridges.
 async fn post_messages(
     client: &Client,
     base_url: &str,
@@ -372,22 +536,14 @@ async fn post_messages(
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
     let mut req = client
         .post(&url)
-        .timeout(REQUEST_TIMEOUT)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("anthropic-version", ANTHROPIC_VERSION);
     if let Some(token) = oauth_token {
-        req = req
-            .bearer_auth(token)
-            .header("anthropic-beta", oauth::OAUTH_BETA)
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", oauth::CLAUDE_CODE_USER_AGENT)
-            .header("x-app", "cli");
+        req = with_oauth_headers(req, token);
     } else if is_oauth_token(api_key) {
         // Static subscription token via the `anthropic` preset.
-        req = req
-            .bearer_auth(api_key)
-            .header("anthropic-beta", oauth::OAUTH_BETA);
+        req = with_oauth_headers(req, api_key);
     } else {
         req = req
             .header("x-api-key", api_key)
@@ -403,9 +559,13 @@ fn request_body(
     upstream_model: &str,
     default_max_tokens: Option<u64>,
     request: &CompletionRequest,
+    supports_images: bool,
 ) -> Value {
-    let (system, messages) =
-        to_anthropic_messages(request.preamble.as_deref(), &request.chat_history);
+    let (system, messages) = to_anthropic_messages(
+        request.preamble.as_deref(),
+        &request.chat_history,
+        supports_images,
+    );
     let mut map = serde_json::Map::new();
     map.insert("model".to_owned(), json!(upstream_model));
     map.insert("messages".to_owned(), Value::Array(messages));
@@ -453,6 +613,7 @@ fn parse_anthropic_usage(u: &Value) -> Usage {
 fn to_anthropic_messages(
     preamble: Option<&str>,
     history: &[Message],
+    supports_images: bool,
 ) -> (Option<Value>, Vec<Value>) {
     let system = preamble.map(|s| json!([{"type": "text", "text": s}]));
     let mut messages = Vec::new();
@@ -466,27 +627,14 @@ fn to_anthropic_messages(
                             blocks.push(json!({"type": "text", "text": t.text}));
                         }
                         UserContent::Image(img) => {
-                            blocks.push(image_block(img));
+                            if supports_images {
+                                blocks.push(image_block(img));
+                            } else {
+                                blocks.push(json!({"type": "text", "text": "[image omitted]"}));
+                            }
                         }
                         UserContent::ToolResult(r) => {
-                            let text = r
-                                .content
-                                .iter()
-                                .map(|b| match b {
-                                    infinity_provider_protocol::ToolResultContent::Text(t) => {
-                                        t.text.clone()
-                                    }
-                                    infinity_provider_protocol::ToolResultContent::Image(_) => {
-                                        "[image omitted]".to_owned()
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            blocks.push(json!({
-                                "type": "tool_result",
-                                "tool_use_id": r.id,
-                                "content": text,
-                            }));
+                            blocks.push(tool_result_block(r, supports_images));
                         }
                     }
                 }
@@ -519,6 +667,54 @@ fn to_anthropic_messages(
         }
     }
     (system, messages)
+}
+
+/// A tool result as an Anthropic `tool_result` block. Images become real
+/// `image` blocks only when the model accepts them; otherwise a text
+/// placeholder keeps the result well-formed without silent data loss.
+fn tool_result_block(
+    result: &infinity_provider_protocol::ToolResult,
+    supports_images: bool,
+) -> Value {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in &result.content {
+        match block {
+            infinity_provider_protocol::ToolResultContent::Text(t) => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&t.text);
+            }
+            infinity_provider_protocol::ToolResultContent::Image(img) => {
+                if supports_images {
+                    images.push(image_block(img));
+                } else {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str("[image omitted]");
+                }
+            }
+        }
+    }
+    if images.is_empty() {
+        return json!({
+            "type": "tool_result",
+            "tool_use_id": result.id,
+            "content": text,
+        });
+    }
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(json!({"type": "text", "text": text}));
+    }
+    blocks.extend(images);
+    json!({
+        "type": "tool_result",
+        "tool_use_id": result.id,
+        "content": blocks,
+    })
 }
 
 fn image_block(img: &infinity_provider_protocol::Image) -> Value {
@@ -564,5 +760,106 @@ fn transport_error(e: reqwest::Error) -> CompletionError {
         CompletionError::RequestError(Box::new(e))
     } else {
         CompletionError::provider(ErrorClass::Transient, format!("transport error: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+
+    fn frame(event: &str, data: &str) -> Vec<u8> {
+        format!("event: {event}\ndata: {data}\n\n").into_bytes()
+    }
+
+    async fn collect<S>(byte_stream: S) -> Vec<Result<StreamChunk, CompletionError>>
+    where
+        S: futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin + Send + 'static,
+    {
+        adapt_stream(byte_stream, std::time::Duration::from_secs(60))
+            .collect()
+            .await
+    }
+
+    fn text_frame(text: &str) -> Vec<u8> {
+        frame(
+            "content_block_delta",
+            &format!("{{\"delta\":{{\"type\":\"text_delta\",\"text\":{text:?}}}}}"),
+        )
+    }
+
+    #[tokio::test]
+    async fn thinking_block_yields_reasoning_with_signature() {
+        let start: Vec<u8> = b"event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n".to_vec();
+        let thinking_start: Vec<u8> =
+            b"event: content_block_start\ndata: {\"content_block\":{\"type\":\"thinking\"}}\n\n"
+                .to_vec();
+        let thinking: Vec<u8> = b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me think\"}}\n\n".to_vec();
+        let signature: Vec<u8> = b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig123\"}}\n\n".to_vec();
+        let stop: Vec<u8> = b"event: content_block_stop\ndata: {}\n\n".to_vec();
+        let delta: Vec<u8> =
+            b"event: message_delta\ndata: {\"usage\":{\"output_tokens\":5}}\n\n".to_vec();
+        let end: Vec<u8> = b"event: message_stop\ndata: {}\n\n".to_vec();
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+            vec![start, thinking_start, thinking, signature, stop, delta, end]
+                .into_iter()
+                .map(Ok)
+                .collect();
+        let out = collect(stream::iter(chunks)).await;
+        let reasoning = out.iter().find_map(|item| match item {
+            Ok(StreamChunk::Reasoning(r)) => Some(r),
+            _ => None,
+        });
+        let reasoning = reasoning.expect("expected a Reasoning chunk");
+        assert_eq!(reasoning.first_text(), Some("let me think"));
+        assert_eq!(reasoning.first_signature(), Some("sig123"));
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamChunk::ReasoningDelta { .. }))),
+            "expected streamed ReasoningDelta, got: {out:?}"
+        );
+        assert!(
+            out.iter().any(|item| matches!(
+                item,
+                Ok(StreamChunk::Final(FinalResponse { usage: Some(_) }))
+            )),
+            "expected Final with usage, got: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_error_terminates_without_final() {
+        let start: Vec<u8> =
+            b"event: content_block_start\ndata: {\"content_block\":{\"type\":\"text\"}}\n\n"
+                .to_vec();
+        let text: Vec<u8> = b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n".to_vec();
+        let error: Vec<u8> =
+            b"event: error\ndata: {\"message\":\"overloaded\",\"type\":\"overloaded_error\"}\n\n"
+                .to_vec();
+        let unreached: Vec<u8> = b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"unreached\"}}\n\n".to_vec();
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![start, text, error, unreached]
+            .into_iter()
+            .map(Ok)
+            .collect();
+        let out = collect(stream::iter(chunks)).await;
+        assert_eq!(out.len(), 2, "error must close the stream: {out:?}");
+        assert!(matches!(&out[0], Ok(StreamChunk::Text(t)) if t == "hi"));
+        match &out[1] {
+            Err(CompletionError::ProviderError { class, .. }) => {
+                assert_eq!(*class, ErrorClass::Transient);
+            }
+            other => panic!("expected transient provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_usage_means_no_usage_in_final() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(text_frame("hi"))];
+        let out = collect(stream::iter(chunks)).await;
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamChunk::Final(FinalResponse { usage: None })))),
+            "unreported usage must stay None, got: {out:?}"
+        );
     }
 }

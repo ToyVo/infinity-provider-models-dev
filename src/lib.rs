@@ -52,6 +52,10 @@ struct Route {
     backend_idx: usize,
     upstream_model: String,
     default_max_tokens: Option<u64>,
+    /// Registration order. `list_models` advertises in this order so the
+    /// global default (the first model of the first backend) follows
+    /// preset order instead of an arbitrary map order.
+    order: usize,
 }
 
 /// [`ModelProvider`] that fans out to every env-configured backend.
@@ -73,6 +77,7 @@ impl MultiProvider {
     pub fn from_backends(backends: Vec<ResolvedBackend>) -> Self {
         let client = reqwest::Client::new();
         let mut routes = HashMap::new();
+        let mut order = 0_usize;
         for (idx, backend) in backends.iter().enumerate() {
             for m in &backend.models {
                 let model_id = format!("{}/{}", backend.preset_id, m.upstream);
@@ -89,6 +94,7 @@ impl MultiProvider {
                     max_output_tokens: m.max_output_tokens,
                     supports_image_input: m.supports_images,
                 };
+                order = order.saturating_add(1);
                 routes.insert(
                     model_id,
                     Route {
@@ -96,6 +102,7 @@ impl MultiProvider {
                         backend_idx: idx,
                         upstream_model: m.upstream.clone(),
                         default_max_tokens: m.max_output_tokens,
+                        order,
                     },
                 );
             }
@@ -137,7 +144,13 @@ impl MultiProvider {
 #[async_trait]
 impl ModelProvider for MultiProvider {
     async fn list_models(&self) -> Result<Vec<ModelEntry>, BoxError> {
-        let mut entries: Vec<ModelEntry> = self.routes.values().map(|r| r.entry.clone()).collect();
+        // Advertise in registration order so the global default (the first
+        // model of the first backend) follows preset order.
+        let mut routes: Vec<&Route> = self.routes.values().collect();
+        routes.sort_by_key(|r| r.order);
+        let mut entries: Vec<ModelEntry> = routes.into_iter().map(|r| r.entry.clone()).collect();
+        let mut known: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.model_id.clone()).collect();
         // Live discovery runs concurrently across backends; each probe is
         // timeout-guarded and falls back to the curated list on failure.
         // Discovered ids need no route entries: `invoke_model` passes any
@@ -153,19 +166,22 @@ impl ModelProvider for MultiProvider {
         for (preset_id, ids) in probed {
             for id in ids {
                 let model_id = format!("{preset_id}/{id}");
-                if entries.iter().any(|e| e.model_id == model_id) {
+                if known.contains(&model_id) {
                     continue;
                 }
+                // Conservative: unknown models are assumed text-only until
+                // curated (an unexpected image payload fails the whole
+                // turn; a placeholder does not).
                 entries.push(ModelEntry {
-                    model_id,
+                    model_id: model_id.clone(),
                     display_name: format!("{id} ({preset_id})"),
                     context_window: 200_000,
                     max_output_tokens: Some(32_000),
-                    supports_image_input: true,
+                    supports_image_input: false,
                 });
+                known.insert(model_id);
             }
         }
-        entries.sort_by(|a, b| a.model_id.cmp(&b.model_id));
         Ok(entries)
     }
 
@@ -174,7 +190,7 @@ impl ModelProvider for MultiProvider {
         model_id: &str,
         request: CompletionRequest,
     ) -> Result<ModelStream, CompletionError> {
-        // `bedrock/<id>` passthrough: allow unknown bedrock-style ids on a
+        // `<backend>/<id>` passthrough: allow unknown upstream ids on a
         // backend whose preset id matches the prefix, so callers can address
         // upstream models not in the advertised list.
         let route = self.routes.get(model_id).cloned().or_else(|| {
@@ -187,11 +203,14 @@ impl ModelProvider for MultiProvider {
                                 display_name: model_id.to_owned(),
                                 context_window: 200_000,
                                 max_output_tokens: Some(32_000),
-                                supports_image_input: true,
+                                supports_image_input: false,
                             },
                             backend_idx: idx,
                             upstream_model: rest.to_owned(),
                             default_max_tokens: Some(32_000),
+                            // Unordered: passthrough routes sort after all
+                            // catalogued routes.
+                            order: usize::MAX,
                         })
                     } else {
                         None
@@ -213,11 +232,15 @@ impl ModelProvider for MultiProvider {
         };
         match backend.flavor {
             Flavor::OpenAi => {
+                let target = openai::Backend {
+                    client: &self.client,
+                    base_url: &backend.base_url,
+                    api_key: &backend.api_key,
+                    extra_headers: &backend.extra_headers,
+                    supports_images: route.entry.supports_image_input,
+                };
                 openai::invoke(
-                    &self.client,
-                    &backend.base_url,
-                    &backend.api_key,
-                    &backend.extra_headers,
+                    &target,
                     &route.upstream_model,
                     route.default_max_tokens,
                     request,
@@ -237,6 +260,7 @@ impl ModelProvider for MultiProvider {
                     &route.upstream_model,
                     route.default_max_tokens,
                     request,
+                    route.entry.supports_image_input,
                 )
                 .await
             }
@@ -271,14 +295,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_namespaced_models_sorted() {
+    async fn lists_namespaced_models_in_registration_order() {
+        // Registration order (not alphabetical) decides the listing: the
+        // daemon treats the first model as the global default.
         let p = MultiProvider::from_backends(vec![
-            backend("groq", vec![("llama-3.3-70b-versatile", "Llama")]),
             backend("openai", vec![("gpt-5.4", "GPT")]),
+            backend("groq", vec![("llama-3.3-70b-versatile", "Llama")]),
         ]);
         let models = p.list_models().await.unwrap();
         let ids: Vec<_> = models.iter().map(|m| m.model_id.as_str()).collect();
-        assert_eq!(ids, vec!["groq/llama-3.3-70b-versatile", "openai/gpt-5.4"]);
+        assert_eq!(ids, vec!["openai/gpt-5.4", "groq/llama-3.3-70b-versatile"]);
     }
 
     #[tokio::test]

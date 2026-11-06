@@ -10,17 +10,25 @@
 use async_stream::stream;
 use futures_util::StreamExt;
 use infinity_provider_protocol::{
-    CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelStream, StreamChunk,
-    ToolCall, ToolCallDeltaContent, ToolDefinition, Usage,
+    CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelStream, Reasoning,
+    ReasoningContent, StreamChunk, ToolCall, ToolCallDeltaContent, ToolDefinition, Usage,
 };
 use reqwest::Client;
 use serde_json::{Value, json};
 
 use crate::convert::{
-    classify_http_status, error_message_from_body, to_openai_messages, to_openai_tools,
+    classify_http_status, error_message_from_body, take_frames, to_openai_messages, to_openai_tools,
 };
 
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long to wait for the endpoint to accept a request (connect, send,
+/// response headers). This deliberately covers only initiation: once a
+/// response stream is live it must never be cut off by a total deadline
+/// (long generations stream for many minutes).
+const REQUEST_INITIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a live stream may go without yielding a chunk before it is
+/// treated as stalled. Chunks normally arrive every few seconds; thinking
+/// gaps on buffered backends can stretch much longer.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Upper bound for one model-list discovery probe.
 const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -32,6 +40,20 @@ struct AccumulatedToolCall {
     name_sent: bool,
 }
 
+/// How to reach and authenticate one `OpenAI`-compatible backend.
+pub struct Backend<'a> {
+    /// Shared HTTP client.
+    pub client: &'a Client,
+    /// Base URL (`.../v1`), without the trailing path.
+    pub base_url: &'a str,
+    /// API key; empty for trust-local endpoints.
+    pub api_key: &'a str,
+    /// Extra headers (e.g. `OpenRouter` attribution).
+    pub extra_headers: &'a [(String, String)],
+    /// Whether the model accepts image input.
+    pub supports_images: bool,
+}
+
 /// Stream one completion from an `OpenAI`-compatible endpoint.
 ///
 /// # Errors
@@ -41,30 +63,46 @@ struct AccumulatedToolCall {
 /// [`CompletionError::ResponseError`] when a live stream breaks mid-flight.
 /// Individual stream items may also yield errors.
 pub async fn invoke(
-    client: &Client,
-    base_url: &str,
-    api_key: &str,
-    extra_headers: &[(String, String)],
+    backend: &Backend<'_>,
     upstream_model: &str,
     default_max_tokens: Option<u64>,
     request: CompletionRequest,
 ) -> Result<ModelStream, CompletionError> {
-    let body = request_body(upstream_model, default_max_tokens, &request);
+    let body = request_body(
+        upstream_model,
+        default_max_tokens,
+        &request,
+        backend.supports_images,
+    );
 
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let mut req = client
+    let url = format!(
+        "{}/chat/completions",
+        backend.base_url.trim_end_matches('/')
+    );
+    let mut req = backend
+        .client
         .post(&url)
-        .timeout(REQUEST_TIMEOUT)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("User-Agent", crate::USER_AGENT);
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
+    if !backend.api_key.is_empty() {
+        req = req.bearer_auth(backend.api_key);
     }
-    for (k, v) in extra_headers {
+    for (k, v) in backend.extra_headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.json(&body).send().await.map_err(transport_error)?;
+    // Bound only initiation (connect, send, response headers). The body
+    // stream below has no total deadline; stalled streams trip the idle
+    // watchdog instead.
+    let resp = tokio::time::timeout(REQUEST_INITIATION_TIMEOUT, req.json(&body).send())
+        .await
+        .map_err(|_| {
+            CompletionError::provider(
+                ErrorClass::Transient,
+                format!("{}: request initiation timed out", backend.base_url),
+            )
+        })?
+        .map_err(transport_error)?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -72,30 +110,64 @@ pub async fn invoke(
         let class = classify_http_status(status, &text);
         return Err(CompletionError::provider(
             class,
-            format!("{base_url} -> {status}: {}", error_message_from_body(&text)),
+            format!(
+                "{} -> {status}: {}",
+                backend.base_url,
+                error_message_from_body(&text)
+            ),
         ));
     }
 
-    let mut byte_stream = resp.bytes_stream();
-    let s = stream! {
+    Ok(adapt_stream(resp.bytes_stream(), STREAM_IDLE_TIMEOUT))
+}
+
+/// Adapt a raw SSE byte stream into protocol chunks.
+///
+/// `idle_timeout` bounds silence between chunks (not the whole stream:
+/// long generations legitimately run for minutes). Transport failures,
+/// stalls, and terminal error frames close the stream *without* a `Final`
+/// so a dead stream never reads as a successful completion.
+fn adapt_stream<S, B, E>(mut byte_stream: S, idle_timeout: std::time::Duration) -> ModelStream
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Box::pin(stream! {
         let mut buf = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut usage: Option<Usage> = None;
+        let mut reasoning = String::new();
+        // Once the stream dies, nothing more can arrive: close without
+        // emitting tool calls, reasoning, or a Final that would read as
+        // success.
+        let mut failed = false;
 
-        while let Some(chunk) = byte_stream.next().await {
+        'chunks: loop {
+            let chunk = tokio::time::timeout(idle_timeout, byte_stream.next()).await;
+            let chunk = match chunk {
+                Err(_) => {
+                    yield Err(CompletionError::ResponseError(
+                        "stream stalled: no chunks received".to_owned(),
+                    ));
+                    failed = true;
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk,
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
                     yield Err(CompletionError::ResponseError(format!("stream read failed: {e}")));
+                    failed = true;
                     break;
                 }
             };
-            buf.push_str(&String::from_utf8_lossy(&bytes));
-            // Process complete `data:` frames; keep the tail.
-            while let Some(end) = buf.find("\n\n").or_else(|| buf.find("\r\n\r\n")) {
-                let frame_end = end.saturating_add(2);
-                let frame: String = buf.drain(..frame_end).collect();
-                buf = buf.trim_start_matches(['\n', '\r']).to_owned();
+            crate::convert::push_bytes(&mut buf, &mut pending, bytes.as_ref());
+            // Process complete `data:` frames; take_frames keeps the tail.
+            for frame in take_frames(&mut buf) {
                 for line in frame.lines() {
                     let line = line.trim();
                     let Some(data) = line.strip_prefix("data:") else { continue };
@@ -103,31 +175,79 @@ pub async fn invoke(
                     if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
-                    let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+                    let Ok(v) = serde_json::from_str::<Value>(data) else {
+                        tracing::debug!(
+                            "openai: skipping malformed frame: {}",
+                            data.chars().take(200).collect::<String>()
+                        );
+                        continue;
+                    };
+                    // Some gateways answer 200 and then report the failure
+                    // as a top-level error object mid-stream. Error frames
+                    // are terminal: stop reading after reporting one.
+                    if let Some(msg) = stream_error_message(&v) {
+                        yield Err(CompletionError::provider(
+                            classify_http_status(400, &msg),
+                            msg,
+                        ));
+                        failed = true;
+                        break 'chunks;
+                    }
                     if let Some(u) = parse_usage(&v) {
                         usage = Some(u);
                     }
-                    for out in parse_choices(&v, &mut tools) {
+                    for out in parse_choices(&v, &mut tools, &mut reasoning) {
                         yield out;
                     }
                 }
             }
         }
-        for tc in std::mem::take(&mut tools) {
-            yield Ok(finish_tool_call(tc));
+        if !failed {
+            for tc in std::mem::take(&mut tools) {
+                if let Some(call) = finish_tool_call(tc) {
+                    yield Ok(call);
+                }
+            }
+            // The complete reasoning block is what gets recorded in
+            // history; deltas above were the UI-facing stream.
+            if !reasoning.is_empty() {
+                yield Ok(StreamChunk::Reasoning(Reasoning {
+                    id: None,
+                    content: vec![ReasoningContent::Text {
+                        text: std::mem::take(&mut reasoning),
+                        signature: None,
+                    }],
+                }));
+            }
+            yield Ok(StreamChunk::Final(FinalResponse { usage }));
         }
-        yield Ok(StreamChunk::Final(FinalResponse { usage }));
-    };
-    Ok(Box::pin(s))
+    })
+}
+
+/// A top-level `{"error": ...}` object in a streamed frame.
+fn stream_error_message(v: &Value) -> Option<String> {
+    match v.get("error") {
+        Some(Value::String(message)) if !message.is_empty() => Some(message.clone()),
+        Some(Value::Object(_)) => v
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    }
 }
 
 fn request_body(
     upstream_model: &str,
     default_max_tokens: Option<u64>,
     request: &CompletionRequest,
+    supports_images: bool,
 ) -> Value {
-    let (messages, system) =
-        to_openai_messages(request.preamble.as_deref(), &request.chat_history, true);
+    let (messages, system) = to_openai_messages(
+        request.preamble.as_deref(),
+        &request.chat_history,
+        supports_images,
+    );
     let mut map = serde_json::Map::new();
     map.insert("model".to_owned(), json!(upstream_model));
     map.insert(
@@ -205,6 +325,7 @@ fn slot_for(
 fn parse_choices(
     v: &Value,
     tools: &mut Vec<AccumulatedToolCall>,
+    reasoning: &mut String,
 ) -> Vec<Result<StreamChunk, CompletionError>> {
     let choices = v
         .get("choices")
@@ -213,7 +334,7 @@ fn parse_choices(
         .unwrap_or_default();
     let mut out = Vec::new();
     for choice in &choices {
-        out.extend(parse_choice(choice, tools));
+        out.extend(parse_choice(choice, tools, reasoning));
     }
     out
 }
@@ -221,6 +342,7 @@ fn parse_choices(
 fn parse_choice(
     choice: &Value,
     tools: &mut Vec<AccumulatedToolCall>,
+    reasoning: &mut String,
 ) -> Vec<Result<StreamChunk, CompletionError>> {
     if let Some(err) = choice.get("error") {
         let msg = err
@@ -240,11 +362,12 @@ fn parse_choice(
             out.push(Ok(StreamChunk::Text(text.to_owned())));
         }
     }
-    if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-        if !reasoning.is_empty() {
+    if let Some(fragment) = delta.get("reasoning_content").and_then(Value::as_str) {
+        if !fragment.is_empty() {
+            reasoning.push_str(fragment);
             out.push(Ok(StreamChunk::ReasoningDelta {
                 id: None,
-                text: reasoning.to_owned(),
+                text: fragment.to_owned(),
             }));
         }
     }
@@ -358,16 +481,19 @@ fn apply_full_message(
     }
 }
 
-fn finish_tool_call(tc: AccumulatedToolCall) -> StreamChunk {
+/// Complete an accumulated tool call, or `None` when the slot never
+/// received a name or arguments (some servers emit empty placeholder
+/// entries that would otherwise surface as noise).
+fn finish_tool_call(tc: AccumulatedToolCall) -> Option<StreamChunk> {
     if tc.name.is_empty() && tc.args.is_empty() {
-        return StreamChunk::Text(String::new());
+        return None;
     }
     let args: Value = if tc.args.trim().is_empty() {
         json!({})
     } else {
         serde_json::from_str(&tc.args).unwrap_or_else(|_| json!({"_raw": tc.args}))
     };
-    StreamChunk::ToolCall(ToolCall::new(tc.id, tc.name, args))
+    Some(StreamChunk::ToolCall(ToolCall::new(tc.id, tc.name, args)))
 }
 
 fn transport_error(e: reqwest::Error) -> CompletionError {
@@ -482,5 +608,127 @@ mod tests {
     fn rejects_unknown_shapes() {
         assert_eq!(discovered_ids(&json!({"models": []})), Vec::<String>::new());
         assert_eq!(discovered_ids(&Value::Null), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use futures_util::stream;
+
+    fn frame(json: &str) -> Vec<u8> {
+        format!("data: {json}\n\n").into_bytes()
+    }
+
+    async fn collect<S, B, E>(
+        byte_stream: S,
+        idle_ms: u64,
+    ) -> Vec<Result<StreamChunk, CompletionError>>
+    where
+        S: futures_util::Stream<Item = Result<B, E>> + Unpin + Send + 'static,
+        B: AsRef<[u8]> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        adapt_stream(byte_stream, std::time::Duration::from_millis(idle_ms))
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn error_frame_terminates_without_final() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(frame(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)),
+            Ok(frame(
+                r#"{"error":{"message":"server overloaded","code":"overloaded"}}"#,
+            )),
+            Ok(frame(r#"{"choices":[{"delta":{"content":"unreached"}}]}"#)),
+        ];
+        let out = collect(stream::iter(chunks), 60_000).await;
+        assert!(matches!(out.first(), Some(Ok(StreamChunk::Text(t))) if t == "hi"));
+        assert_eq!(out.len(), 2, "error must close the stream: {out:?}");
+        match &out[1] {
+            Err(CompletionError::ProviderError { class, .. }) => {
+                assert_eq!(*class, ErrorClass::Transient);
+            }
+            other => panic!("expected classified provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_errors_without_final() {
+        let pending = stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let out = collect(pending, 50).await;
+        assert_eq!(out.len(), 1, "stall must close the stream: {out:?}");
+        assert!(
+            matches!(&out[0], Err(CompletionError::ResponseError(_))),
+            "unexpected: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_drip_stream_completes() {
+        let chunks = stream::unfold(0_u32, |n| async move {
+            if n >= 3 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let frame = frame(&format!(
+                r#"{{"choices":[{{"delta":{{"content":"{n}"}}}}]}}"#
+            ));
+            Some((Ok::<Vec<u8>, std::io::Error>(frame), n + 1))
+        });
+        let out = collect(Box::pin(chunks), 5_000).await;
+        assert!(
+            matches!(
+                &out[..],
+                [
+                    Ok(StreamChunk::Text(_)),
+                    Ok(StreamChunk::Text(_)),
+                    Ok(StreamChunk::Text(_)),
+                    Ok(StreamChunk::Final(_))
+                ]
+            ),
+            "unexpected: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_accumulates_name_and_args() {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+            Ok(frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":""}}]}}]}"#,
+            )),
+            Ok(frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]}}]}"#,
+            )),
+            Ok(frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"sf\"}"}}]}}]}"#,
+            )),
+            Ok(frame(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)),
+            Ok(b"data: [DONE]\n\n".to_vec()),
+        ];
+        let out = collect(stream::iter(chunks), 60_000).await;
+        let names: Vec<_> = out
+            .iter()
+            .filter_map(|item| match item {
+                Ok(StreamChunk::ToolCallDelta {
+                    content: ToolCallDeltaContent::Name(n),
+                    ..
+                }) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["get_weather".to_owned()]);
+        assert!(
+            out.iter().any(|item| matches!(
+                item,
+                Ok(StreamChunk::ToolCall(call)) if call.function.name == "get_weather"
+            )),
+            "expected a complete tool call, got: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|item| matches!(item, Ok(StreamChunk::Final(_))))
+        );
     }
 }
