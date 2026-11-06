@@ -13,8 +13,8 @@ toml = "0.8"
 //! Sources:
 //! - <https://github.com/anomalyco/models.dev> (checkout via `--models-dev`):
 //!   canonical ids, display names, live/deprecated status, image modalities.
-//! - Upstream `models.dev` `api.json` (via `--upstream`): complete
-//!   `limit.context` / `limit.output` / `tool_call` for every model (the fork
+//! - The published `models.dev` `api.json` snapshot (via `--upstream`): complete
+//!   `limit.context` / `limit.output` / `tool_call` for every model (the source repo
 //!   keeps limits per-API or in prose, so it is not machine-readable
 //!   everywhere).
 //!
@@ -44,9 +44,9 @@ struct Preset {
     key_envs: &'static [&'static str],
 }
 
-// Keep in sync with `preset.rs`: which fork provider and curated models back
+// Keep in sync with `preset.rs`: which source provider and curated models back
 // each preset, plus the key env vars we read (cross-checked against the
-// fork's `provider.toml`).
+// source's `provider.toml`).
 const CATALOG: &[Preset] = &[
     Preset {
         id: "openai",
@@ -201,9 +201,16 @@ const CATALOG: &[Preset] = &[
         key_envs: &["AI_GATEWAY_API_KEY"],
     },
     Preset {
-        id: "opencode-zen",
+        id: "opencode",
         provider: "opencode",
-        models: &["claude-sonnet-4-6"],
+        models: &["kimi-k2.7-code", "claude-sonnet-5"],
+        suffix: "",
+        key_envs: &["OPENCODE_API_KEY"],
+    },
+    Preset {
+        id: "opencode-go",
+        provider: "opencode-go",
+        models: &["kimi-k3", "deepseek-v4-pro"],
         suffix: "",
         key_envs: &["OPENCODE_API_KEY"],
     },
@@ -410,7 +417,7 @@ fn run() -> Result<(), String> {
                     for ours in preset.key_envs {
                         if !envs.iter().any(|e| e == ours) {
                             println!(
-                                "note: [{}] our key {ours} not in fork provider.toml env {envs:?}",
+                                "note: [{}] our key {ours} not in source provider.toml env {envs:?}",
                                 preset.id
                             );
                         }
@@ -418,7 +425,7 @@ fn run() -> Result<(), String> {
                     for theirs in &envs {
                         if !preset.key_envs.contains(&theirs.as_str()) {
                             println!(
-                                "note: [{}] fork lists env {theirs} we do not read",
+                                "note: [{}] source lists env {theirs} we do not read",
                                 preset.id
                             );
                         }
@@ -463,34 +470,34 @@ fn run() -> Result<(), String> {
                 failures += 1;
                 continue;
             }
-            let fork_limit = table(&doc, "limit");
-            let fork_ctx = fork_limit
+            let source_limit = table(&doc, "limit");
+            let source_ctx = source_limit
                 .and_then(|l| l.get("context"))
                 .and_then(toml::Value::as_integer);
-            let fork_out = fork_limit
+            let source_out = source_limit
                 .and_then(|l| l.get("output"))
                 .and_then(toml::Value::as_integer);
             let up_entry = up_models.and_then(|models| models.get(*mid));
             let up_limit = up_entry.and_then(|e| e.get("limit"));
-            let context = fork_ctx.or_else(|| {
+            let context = source_ctx.or_else(|| {
                 up_limit
                     .and_then(|l| l.get("context"))
                     .and_then(serde_json::Value::as_i64)
             });
-            let output = fork_out.or_else(|| {
+            let output = source_out.or_else(|| {
                 up_limit
                     .and_then(|l| l.get("output"))
                     .and_then(serde_json::Value::as_i64)
             });
             let Some(context) = context else {
                 println!(
-                    "error: [{}] {mid}: no limit.context in fork or upstream",
+                    "error: [{}] {mid}: no limit.context in source or upstream",
                     preset.id
                 );
                 failures += 1;
                 continue;
             };
-            let fork_tools = table(&doc, "capabilities")
+            let source_tools = table(&doc, "capabilities")
                 .and_then(|c| c.get("tools"))
                 .and_then(|t| t.as_table())
                 .and_then(|t| t.get("supported"))
@@ -498,9 +505,9 @@ fn run() -> Result<(), String> {
             let up_tools = up_entry
                 .and_then(|e| e.get("tool_call"))
                 .and_then(serde_json::Value::as_bool);
-            if fork_tools != Some(true) && up_tools != Some(true) {
+            if source_tools != Some(true) && up_tools != Some(true) {
                 println!(
-                    "warn: [{0}] {mid}: no function calling (fork={fork_tools:?} upstream={up_tools:?})",
+                    "warn: [{0}] {mid}: no function calling (source={source_tools:?} upstream={up_tools:?})",
                     preset.id
                 );
             }
@@ -565,7 +572,7 @@ fn run() -> Result<(), String> {
     }
 
     let header = format!(
-        "//! Model catalog generated from anomalyco/models.dev.\n//! DO NOT EDIT — regenerate with `rust-script scripts/sync-models-dev.rs`.\n//! Fork revision: anomalyco/models.dev@{rev}.\n\nuse crate::preset::PresetModel;\n"
+        "//! Model catalog generated from anomalyco/models.dev.\n//! DO NOT EDIT — regenerate with `rust-script scripts/sync-models-dev.rs`.\n//! Source revision: anomalyco/models.dev@{rev}.\n\nuse crate::preset::PresetModel;\n"
     );
     let contents = header + &chunks.join("\n") + "\n";
     std::fs::write(&args.out, contents)

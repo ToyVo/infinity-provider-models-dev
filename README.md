@@ -62,7 +62,8 @@ Export any of the keys below; the corresponding backend activates automatically 
 | `qwen/` | `QWEN_TOKEN_PLAN_API_KEY` / `DASHSCOPE_API_KEY` … | DashScope compat endpoint |
 | `huggingface/` | `HF_TOKEN` | `https://router.huggingface.co/v1` |
 | `vercel-gateway/` | `AI_GATEWAY_API_KEY` | `https://ai-gateway.vercel.sh/v1` |
-| `opencode-zen/` | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `opencode/` | `OPENCODE_API_KEY` | `https://opencode.ai/inference/openai/v1` (full catalog discovered) |
+| `opencode-go/` | `OPENCODE_API_KEY` (Go subscription) | `https://opencode.ai/inference/go/openai/v1` (full catalog discovered) |
 | `claude-oauth/` | `INFINITY_CLAUDE_OAUTH=1` + subscription login (see below) | `https://api.anthropic.com` (native Messages API, subscription billing) |
 | `azure/` | `AZURE_OPENAI_API_KEY` (or `AZURE_API_KEY`) + `AZURE_OPENAI_BASE_URL` or `AZURE_OPENAI_RESOURCE_NAME` | derived `https://{resource}.openai.azure.com/openai/v1` |
 | `baseten/` | `BASETEN_API_KEY` + `BASETEN_BASE_URL` | (endpoint required) |
@@ -70,6 +71,8 @@ Export any of the keys below; the corresponding backend activates automatically 
 | `custom/` | `INFINITY_OPENAI_API_KEY` + `INFINITY_OPENAI_BASE_URL` + `INFINITY_OPENAI_MODELS` | any OpenAI-compat proxy/gateway |
 
 Pi extras honored: `OPENROUTER_APP_NAME`/`OPENROUTER_APP_URL`, `MOONSHOT`/`KIMI` CN variants, `MINIMAX_CN_API_KEY`, `QWEN_TOKEN_PLAN_CN_API_KEY`, `XIAOMI_*` via `custom/` + base URL.
+
+OpenCode Go sends a stable per-process `x-opencode-session` id for routing and prompt-cache affinity (as their docs request); override it with `OPENCODE_SESSION_ID` if you need a specific value.
 
 ### Per-backend overrides
 

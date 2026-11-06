@@ -75,6 +75,10 @@ pub struct Preset {
     pub no_auth: bool,
     /// Whether this preset uses Claude subscription `OAuth` (see `oauth`).
     pub oauth_subscription: bool,
+    /// Advertise the endpoint's live model list by default (in addition to
+    /// the curated catalog). Local servers always discover; cloud backends
+    /// can also opt in per backend with `<PREFIX>_DISCOVER=1`.
+    pub discover: bool,
 }
 
 pub const PRESETS: &[Preset] = &[
@@ -87,6 +91,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::OPENAI,
     },
     Preset {
@@ -102,6 +107,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::Anthropic,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::ANTHROPIC,
     },
     Preset {
@@ -113,6 +119,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::Anthropic,
         no_auth: false,
         oauth_subscription: true,
+        discover: false,
         models: crate::catalog_generated::CLAUDE_OAUTH,
     },
     Preset {
@@ -124,6 +131,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::DEEPSEEK,
     },
     Preset {
@@ -135,6 +143,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::GROQ,
     },
     Preset {
@@ -146,6 +155,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::CEREBRAS,
     },
     Preset {
@@ -157,6 +167,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::XAI,
     },
     Preset {
@@ -168,6 +179,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::MISTRAL,
     },
     Preset {
@@ -183,6 +195,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::GEMINI,
     },
     Preset {
@@ -194,6 +207,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::TOGETHER,
     },
     Preset {
@@ -205,6 +219,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::FIREWORKS,
     },
     Preset {
@@ -216,6 +231,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::OPENROUTER,
     },
     Preset {
@@ -227,6 +243,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::NVIDIA,
     },
     Preset {
@@ -238,6 +255,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::MOONSHOT,
     },
     Preset {
@@ -249,6 +267,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::ZAI,
     },
     Preset {
@@ -260,6 +279,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::MINIMAX,
     },
     Preset {
@@ -275,6 +295,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::QWEN,
     },
     Preset {
@@ -286,6 +307,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: &[],
     },
     Preset {
@@ -297,6 +319,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::HUGGINGFACE,
     },
     Preset {
@@ -308,18 +331,32 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::VERCEL_GATEWAY,
     },
     Preset {
-        id: "opencode-zen",
+        id: "opencode",
         prefix: "OPENCODE",
         key_envs: &["OPENCODE_API_KEY"],
         base_envs: &["OPENCODE_BASE_URL"],
-        default_base_url: Some("https://opencode.ai/zen/v1"),
+        default_base_url: Some("https://opencode.ai/inference/openai/v1"),
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
-        models: crate::catalog_generated::OPENCODE_ZEN,
+        discover: true,
+        models: crate::catalog_generated::OPENCODE,
+    },
+    Preset {
+        id: "opencode-go",
+        prefix: "OPENCODE_GO",
+        key_envs: &["OPENCODE_API_KEY"],
+        base_envs: &["OPENCODE_GO_BASE_URL"],
+        default_base_url: Some("https://opencode.ai/inference/go/openai/v1"),
+        flavor: Flavor::OpenAi,
+        no_auth: false,
+        oauth_subscription: false,
+        discover: true,
+        models: crate::catalog_generated::OPENCODE_GO,
     },
     Preset {
         id: "azure",
@@ -330,6 +367,7 @@ pub const PRESETS: &[Preset] = &[
         flavor: Flavor::OpenAi,
         no_auth: false,
         oauth_subscription: false,
+        discover: false,
         models: crate::catalog_generated::AZURE,
     },
     Preset {
@@ -348,6 +386,7 @@ pub const PRESETS: &[Preset] = &[
         }],
         no_auth: true,
         oauth_subscription: false,
+        discover: true,
     },
     Preset {
         id: "lmstudio",
@@ -359,6 +398,7 @@ pub const PRESETS: &[Preset] = &[
         models: &[],
         no_auth: true,
         oauth_subscription: false,
+        discover: true,
     },
     Preset {
         id: "vllm",
@@ -370,6 +410,7 @@ pub const PRESETS: &[Preset] = &[
         models: &[],
         no_auth: true,
         oauth_subscription: false,
+        discover: true,
     },
 ];
 
@@ -419,6 +460,25 @@ fn display_for(id: &str) -> String {
     id.to_owned()
 }
 
+/// Stable per-process session id for `opencode-go` (`x-opencode-session`).
+/// Overridable with `OPENCODE_SESSION_ID`.
+fn session_id() -> String {
+    if let Some(id) = non_empty("OPENCODE_SESSION_ID") {
+        return id;
+    }
+    let mut random = [0_u8; 16];
+    if getrandom::fill(&mut random).is_err() {
+        return "infinity-provider-models-dev".to_owned();
+    }
+    random
+        .iter()
+        .fold(String::with_capacity(32), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 impl Preset {
     fn resolve(&self) -> Option<ResolvedBackend> {
         if self.oauth_subscription {
@@ -457,10 +517,19 @@ impl Preset {
         let api_key = first_set(self.key_envs)?;
         // `<PREFIX>_DISCOVER=1` merges the endpoint's live model list into
         // the curated catalog (off by default: cloud catalogs are noisy).
-        let discover = std::env::var(format!("{}_DISCOVER", self.prefix))
-            .ok()
-            .as_deref()
-            == Some("1");
+        // `discover` presets (e.g. `opencode`) always discover.
+        let discover = self.discover
+            || std::env::var(format!("{}_DISCOVER", self.prefix))
+                .ok()
+                .as_deref()
+                == Some("1");
+        // Go asks clients for a stable per-conversation session id for
+        // routing and prompt-cache affinity; ours is stable per provider
+        // process and overridable via `OPENCODE_SESSION_ID`.
+        let mut extra_headers = Vec::new();
+        if self.id == "opencode-go" {
+            extra_headers.push(("x-opencode-session".to_owned(), session_id()));
+        }
         let mut base_url = first_set(self.base_envs)
             .or_else(|| non_empty(&format!("{}_BASE_URL", self.prefix)))
             .or_else(|| self.default_base_url.map(str::to_owned));
@@ -484,7 +553,6 @@ impl Preset {
             return None;
         }
 
-        let mut extra_headers = Vec::new();
         if self.id == "openrouter" {
             extra_headers.push((
                 "HTTP-Referer".to_owned(),
@@ -708,6 +776,85 @@ mod tests {
         assert_eq!(backend.models.len(), 3);
 
         restore(&saved_token, &saved_opt_in);
+    }
+
+    /// `opencode` / `opencode-go` share one key; Go additionally sends a
+    /// stable session header. Touches only `OPENCODE_*` vars.
+    #[test]
+    fn opencode_presets_share_key_and_go_sends_session() {
+        let saved_key = std::env::var("OPENCODE_API_KEY").ok();
+        let saved_session = std::env::var("OPENCODE_SESSION_ID").ok();
+        let restore = |saved_key: &Option<String>, saved_session: &Option<String>| {
+            if let Some(key) = saved_key {
+                unsafe {
+                    std::env::set_var("OPENCODE_API_KEY", key);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("OPENCODE_API_KEY");
+                }
+            }
+            if let Some(session) = saved_session {
+                unsafe {
+                    std::env::set_var("OPENCODE_SESSION_ID", session);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("OPENCODE_SESSION_ID");
+                }
+            }
+        };
+        let find = |id: &str| {
+            PRESETS
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} preset exists"))
+        };
+
+        unsafe {
+            std::env::remove_var("OPENCODE_API_KEY");
+            std::env::remove_var("OPENCODE_SESSION_ID");
+        }
+        assert!(find("opencode").resolve().is_none());
+        assert!(find("opencode-go").resolve().is_none());
+
+        unsafe {
+            std::env::set_var("OPENCODE_API_KEY", "ok-test");
+        }
+        let base = find("opencode").resolve().expect("opencode activates");
+        assert!(base.discover);
+        assert!(base.models.len() >= 2);
+        assert!(
+            base.extra_headers
+                .iter()
+                .all(|(k, _)| k != "x-opencode-session"),
+            "session header is Go-only"
+        );
+        let go = find("opencode-go")
+            .resolve()
+            .expect("opencode-go activates");
+        assert!(go.discover);
+        let session = go
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k == "x-opencode-session")
+            .map(|(_, v)| v.clone());
+        assert!(session.is_some_and(|s| !s.is_empty()));
+
+        unsafe {
+            std::env::set_var("OPENCODE_SESSION_ID", "pinned-session");
+        }
+        let go = find("opencode-go")
+            .resolve()
+            .expect("opencode-go activates");
+        assert!(
+            go.extra_headers
+                .iter()
+                .any(|(k, v)| k == "x-opencode-session" && v == "pinned-session"),
+            "explicit session id wins"
+        );
+
+        restore(&saved_key, &saved_session);
     }
 
     #[test]

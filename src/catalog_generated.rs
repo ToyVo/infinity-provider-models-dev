@@ -1,6 +1,6 @@
 //! Model catalog generated from anomalyco/models.dev.
 //! DO NOT EDIT — regenerate with `rust-script scripts/sync-models-dev.rs`.
-//! Fork revision: anomalyco/models.dev@a276c37.
+//! Source revision: anomalyco/models.dev@a276c37.
 
 use crate::preset::PresetModel;
 pub const OPENAI: &[PresetModel] = &[
@@ -301,13 +301,38 @@ pub const VERCEL_GATEWAY: &[PresetModel] = &[PresetModel {
     max_output_tokens: Some(128_000),
     supports_images: true,
 }];
-pub const OPENCODE_ZEN: &[PresetModel] = &[PresetModel {
-    id: "claude-sonnet-4-6",
-    display_name: "Claude Sonnet 4.6",
-    context_window: 1_000_000,
-    max_output_tokens: Some(64_000),
-    supports_images: true,
-}];
+pub const OPENCODE: &[PresetModel] = &[
+    PresetModel {
+        id: "kimi-k2.7-code",
+        display_name: "Kimi K2.7 Code",
+        context_window: 262_144,
+        max_output_tokens: Some(262_144),
+        supports_images: true,
+    },
+    PresetModel {
+        id: "claude-sonnet-5",
+        display_name: "Claude Sonnet 5",
+        context_window: 1_000_000,
+        max_output_tokens: Some(128_000),
+        supports_images: true,
+    },
+];
+pub const OPENCODE_GO: &[PresetModel] = &[
+    PresetModel {
+        id: "kimi-k3",
+        display_name: "Kimi K3",
+        context_window: 1_048_576,
+        max_output_tokens: Some(131_072),
+        supports_images: true,
+    },
+    PresetModel {
+        id: "deepseek-v4-pro",
+        display_name: "DeepSeek V4 Pro",
+        context_window: 1_000_000,
+        max_output_tokens: Some(384_000),
+        supports_images: false,
+    },
+];
 pub const AZURE: &[PresetModel] = &[PresetModel {
     id: "gpt-5.4",
     display_name: "GPT-5.4",
